@@ -1,18 +1,19 @@
-#!/usr/bin/env Rscript
-
-# ============================================
-# \_\_\_\_  \_  \_\_\_\_\_  \_   Rheinisch-
-# \_   \_\_ \__ \_  \_  \_  \_   Westfaelische
-# \_\_\_  \_\_\_\_  \_  \_\_\_   Technische
-# \_  \_   \__ \__  \_  \_  \_   Hochschule
-# \_   \_   \_  \_  \_  \_  \_   Aachen
-# ============================================
+# ============================================ #
+#  \_\_\_\_  \_  \_\_\_\_\_  \_  Rheinisch-    #
+#  \_   \_\_ \__ \_  \_  \_  \_  Westfaelische #
+#  \_\_\_  \_\_\_\_  \_  \_\_\_  Technische    #
+#  \_  \_   \__ \__  \_  \_  \_  Hochschule    #
+#  \_   \_   \_  \_  \_  \_  \_  Aachen        #
+# ============================================ #
 
 # ==============================================================================
+# TCGA-Survival Analysis
+# Project: MD
 # Author: Tim Detering
-# Focus: TCGA genewise survival Pipeline
-# filename: tcga_survival_genewise.R
+# filename: TCGA_surv_analysis.R
 # ==============================================================================
+
+#!/usr/bin/env Rscript
 
 suppressPackageStartupMessages({
   library(TCGAbiolinks)
@@ -24,22 +25,23 @@ suppressPackageStartupMessages({
   library(readr)
 })
 
-# Parameter
+# --- Parameter ---
 TARGET_GENES <- c("ITIH2", "ITIH5")
 OUT_DIR <- "results_tcga_final"
 MIN_SAMPLES <- 30
 dir.create(OUT_DIR, showWarnings = FALSE)
 
-# HPC Setup
+# HPC Setup (RWTH Cluster)
 n_cores <- as.numeric(Sys.getenv("SLURM_CPUS_PER_TASK"))
 if (is.na(n_cores)) n_cores <- 4
 plan(multicore, workers = n_cores)
 
 analyze_project <- function(project) {
   project_results <- list()
+  message(sprintf("\n[%s] Processing entity...", project))
   
   tryCatch({
-    clin <- GDCquery_clinic(project = project, type = "clinical")
+    # 1. Daten-Download & Vorbereitung
     query <- GDCquery(
       project = project,
       data.category = "Transcriptome Profiling",
@@ -49,24 +51,28 @@ analyze_project <- function(project) {
     GDCdownload(query, method = "api", directory = "GDCdata")
     se <- GDCprepare(query, directory = "GDCdata")
     
-    expr_matrix <- assay(se, "fpkm_unstrand")
-    rownames(expr_matrix) <- rowData(se)$gene_name
-    colnames(expr_matrix) <- substr(colnames(expr_matrix), 1, 12)
-    expr_matrix <- t(simplify2array(by(t(expr_matrix), colnames(expr_matrix), colMeans)))
-
-    # GENEWISE ITERATION
+    clin <- GDCquery_clinic(project = project, type = "clinical")
+    
+    rd <- as.data.frame(rowData(se))
+    
     for (gene in TARGET_GENES) {
-      # Prüfung: Gen vorhanden?
-      if (!(gene %in% rownames(expr_matrix))) {
-        message(sprintf("[%s] SKIP %s: Gen nicht im Datensatz vorhanden.", project, gene))
+      
+      gene_idx <- which(rd$gene_name == gene)
+      
+      if (length(gene_idx) == 0) {
+        message(sprintf("[%s] SKIP %s: Gene symbol not found in rowData.", project, gene))
         next
       }
-
-      df_gene <- data.frame(
-        submitter_id = colnames(expr_matrix),
-        expression = expr_matrix[gene, ]
-      )
-
+      
+      gene_idx <- gene_idx[1]
+      
+      expr_vals <- assay(se, "fpkm_unstrand")[gene_idx, ]
+      
+      patients <- substr(names(expr_vals), 1, 12)
+      df_gene <- data.frame(submitter_id = patients, expression = expr_vals) %>%
+        group_by(submitter_id) %>%
+        summarise(expression = mean(expression), .groups = 'drop')
+      
       df_merged <- clin %>%
         inner_join(df_gene, by = "submitter_id") %>%
         mutate(
@@ -74,32 +80,34 @@ analyze_project <- function(project) {
           OS_status = ifelse(vital_status == "Dead", 1, 0)
         ) %>%
         filter(!is.na(OS_time), OS_time > 0)
-
+      
       if (nrow(df_merged) < MIN_SAMPLES) {
-        message(sprintf("[%s] SKIP %s: Zu wenige Samples (N=%d) für KM-Plot.", project, gene, nrow(df_merged)))
+        message(sprintf("[%s] SKIP %s: Too few samples with clinical data (N=%d).", project, gene, nrow(df_merged)))
         next
       }
-
-      # OPTIMAL CUT OFF SELECTION WITH SURV_CUTPOINT
+      
       res_cut <- try(surv_cutpoint(df_merged, time = "OS_time", event = "OS_status", variables = "expression"), silent = TRUE)
+      
       if (inherits(res_cut, "try-error")) {
-        message(sprintf("[%s] SKIP %s: Cut-Off konnte nicht berechnet werden.", project, gene))
+        message(sprintf("[%s] SKIP %s: Could not determine optimal cut-point (check variance).", project, gene))
         next
       }
       
       opt_cut <- res_cut$expression$estimate
       df_merged$Group <- ifelse(df_merged$expression >= opt_cut, "High", "Low")
       df_merged$Group <- factor(df_merged$Group, levels = c("Low", "High"))
-
-      # KM-PLOTTING
-      fit <- survfit(Surv(OS_time, OS_status) ~ Group, data = df_merged)
-      p <- ggsurvplot(fit, data = df_merged, pval = TRUE, risk.table = TRUE,
-                      title = paste(project, "-", gene), palette = c("blue", "red"))
       
-      pdf(file.path(OUT_DIR, paste0(project, "_", gene, "_KM.pdf")), width = 7, height = 7, onefile = FALSE)
+      fit <- survfit(Surv(OS_time, OS_status) ~ Group, data = df_merged)
+      
+      p <- ggsurvplot(fit, data = df_merged, pval = TRUE, risk.table = TRUE,
+                      title = paste(project, "-", gene),
+                      palette = c("blue", "red"), 
+                      legend.labs = c("Low Expression", "High Expression"))
+      
+      pdf(file.path(OUT_DIR, paste0(project, "_", gene, "_KM.pdf")), width = 8, height = 7, onefile = FALSE)
       print(p)
       dev.off()
-
+      
       cox_fit <- coxph(Surv(OS_time, OS_status) ~ Group, data = df_merged)
       cox_sum <- summary(cox_fit)
       
@@ -107,30 +115,28 @@ analyze_project <- function(project) {
         Entity = project,
         Gene = gene,
         N = nrow(df_merged),
-        CutOff = opt_cut,
+        CutOff_FPKM = opt_cut,
         HazardRatio = cox_sum$coefficients[1, "exp(coef)"],
-        Lower_CI = cox_sum$conf.int[1, "lower .95"],
-        Upper_CI = cox_sum$conf.int[1, "upper .95"],
         Cox_Pval = cox_sum$coefficients[1, "Pr(>|z|)"],
-        KM_LogRank_Pval = surv_pvalue(fit)$pval
+        KM_Pval = surv_pvalue(fit)$pval
       )
     }
     
-    rm(se, expr_matrix, query)
+    rm(se, query, clin, rd)
     gc()
+    
     return(bind_rows(project_results))
     
   }, error = function(e) {
-    message(sprintf("[%s] FATAL ERROR: %s", project, e$message))
+    message(sprintf("[%s] CRITICAL ERROR: %s", project, e$message))
     return(NULL)
   })
 }
 
-# Durchführung
-tcga_projects <- grep("^TCGA-", getGDCprojects()$project_id, value = TRUE)
-final_results <- future_lapply(tcga_projects, analyze_project, future.seed = TRUE)
+all_projects <- grep("^TCGA-", getGDCprojects()$project_id, value = TRUE)
+master_results_list <- future_lapply(all_projects, analyze_project, future.seed = TRUE)
 
-# Export
-all_stats <- bind_rows(final_results)
-write_csv(all_stats, file.path(OUT_DIR, "TCGA_ITIH_Comprehensive_Results.csv"))
-message("Analysis finished. Filen in: ", OUT_DIR)
+all_stats <- bind_rows(master_results_list)
+write_csv(all_stats, file.path(OUT_DIR, "TCGA_ITIH_PanCancer_Summary.csv"))
+
+message("\nDone! All results are in: ", OUT_DIR)
