@@ -50,29 +50,17 @@ suppressPackageStartupMessages({
 
 
 # --- 2. Pre-specified Analysis Parameters [REMARK Item 8, 10] -----------------
-# ALL parameters below are fixed a priori.
-# Changing them post-hoc constitutes an undisclosed protocol deviation.
 
 TARGET_GENES  <- c("ITIH2", "ITIH5")
 OUT_DIR       <- "results_tcga_REMARK"
-MIN_SAMPLES   <- 30        # minimum evaluable patients after merge
-MIN_EVENTS    <- 10        # minimum outcome events required per group
-
-# [REMARK Item 8] Cutoff method must be declared a priori.
-# "tertile": upper vs. lower tertile; middle tertile excluded to sharpen contrast.
-# Rationale: avoids data-driven cutpoint optimisation (Altman et al. 1994),
-# which inflates type-I error. Median is a valid alternative.
-CUTOFF_METHOD <- "tertile"   # "median" | "tertile"
+MIN_SAMPLES   <- 30        
+MIN_EVENTS    <- 10        
+CUTOFF_METHOD <- "tertile"   
 
 # [REMARK Item 10] Multivariable model covariates pre-specified:
-# - age_at_diagnosis (continuous): established prognostic factor in most entities
-# - stage_num (ordinal 1-4): primary clinical staging variable
-# Additional covariates (e.g. MSI status, grade) should be added per entity
-# in a protocol amendment with written justification.
 MV_COVARIATES <- c("age_at_diagnosis", "stage_num")
-MV_MIN_OBS    <- 10   # minimum non-NA observations per covariate for MV Cox
+MV_MIN_OBS    <- 10   
 
-# FDR threshold for significance flagging (not for analysis decisions)
 FDR_THRESHOLD <- 0.05
 
 dir.create(OUT_DIR,                              showWarnings = FALSE)
@@ -435,7 +423,7 @@ analyze_project <- function(project) {
         limitations <- c(limitations, "stage_missing_>20pct")
       limitations_str <- if (length(limitations) > 0) paste(limitations, collapse = "; ") else "none"
       
-      # ---- Collect results [REMARK Items 9, 12, 14, 15, 16] -----------------
+      # ---- Collecting results [REMARK Items 9, 12, 14, 15, 16] -----------------
       project_results[[gene]] <- data.frame(
         # Identity
         Entity                 = project,
@@ -482,7 +470,7 @@ analyze_project <- function(project) {
       
     } # end gene loop
     
-    # Write exclusion log for this project [REMARK Item 6]
+    # Write exclusion log [REMARK Item 6]
     if (nrow(excl_log) > 0) {
       write_csv(excl_log,
                 file.path(OUT_DIR, "exclusion_logs",
@@ -523,7 +511,6 @@ final_df <- bind_rows(lapply(raw_results, function(x) if (!is.null(x)) x$results
 dist_df  <- bind_rows(lapply(raw_results, function(x) if (!is.null(x)) x$distributions))
 
 # [REMARK Item 14] FDR correction per gene across all tested entities
-# Applied to both endpoints and both model types
 final_df <- final_df %>%
   group_by(Gene) %>%
   mutate(
@@ -534,7 +521,6 @@ final_df <- final_df %>%
     Sig_OS_uv           = !is.na(FDR_OS_LogRank)    & FDR_OS_LogRank    < FDR_THRESHOLD,
     Sig_OS_mv           = !is.na(FDR_OS_multivariate) & FDR_OS_multivariate < FDR_THRESHOLD,
     Sig_PFS             = !is.na(FDR_PFS_LogRank)   & FDR_PFS_LogRank   < FDR_THRESHOLD,
-    # Direction coding: only for FDR-significant results
     Direction_OS = dplyr::case_when(
       Sig_OS_uv & HR_OS_uv > 1 ~ "poor_prognosis",
       Sig_OS_uv & HR_OS_uv < 1 ~ "good_prognosis",
