@@ -13,6 +13,7 @@
 # filename: TCGA_remark.R
 # ==============================================================================
 
+
 # ==============================================================================
 # Guidelines:
 #   McShane LM et al. (2005) JNCI 97:1180-1184  [REMARK]
@@ -50,17 +51,29 @@ suppressPackageStartupMessages({
 
 
 # --- 2. Pre-specified Analysis Parameters [REMARK Item 8, 10] -----------------
+# ALL parameters below are fixed a priori.
+# Changing them post-hoc constitutes an undisclosed protocol deviation.
 
 TARGET_GENES  <- c("ITIH2", "ITIH5")
 OUT_DIR       <- "results_tcga_REMARK"
-MIN_SAMPLES   <- 30        
-MIN_EVENTS    <- 10        
-CUTOFF_METHOD <- "tertile"   
+MIN_SAMPLES   <- 30        # minimum evaluable patients after merge
+MIN_EVENTS    <- 10        # minimum outcome events required per group
+
+# [REMARK Item 8] Cutoff method must be declared a priori.
+# "tertile": upper vs. lower tertile; middle tertile excluded to sharpen contrast.
+# Rationale: avoids data-driven cutpoint optimisation (Altman et al. 1994),
+# which inflates type-I error. Median is a valid alternative.
+CUTOFF_METHOD <- "tertile"   # "median" | "tertile"
 
 # [REMARK Item 10] Multivariable model covariates pre-specified:
+# - age_at_diagnosis (continuous): established prognostic factor in most entities
+# - stage_num (ordinal 1-4): primary clinical staging variable
+# Additional covariates (e.g. MSI status, grade) should be added per entity
+# in a protocol amendment with written justification.
 MV_COVARIATES <- c("age_at_diagnosis", "stage_num")
-MV_MIN_OBS    <- 10   
+MV_MIN_OBS    <- 10   # minimum non-NA observations per covariate for MV Cox
 
+# FDR threshold for significance flagging (not for analysis decisions)
 FDR_THRESHOLD <- 0.05
 
 dir.create(OUT_DIR,                              showWarnings = FALSE)
@@ -131,17 +144,17 @@ marker_distribution <- function(expr_vec, gene, project) {
 
 # --- 4. Core Analysis Function ------------------------------------------------
 analyze_project <- function(project) {
-  
+
   project_results      <- list()
   project_distributions <- list()
-  
+
   # [REMARK Item 6] Exclusion log: track every patient removed and reason
   excl_log <- data.frame(
     Project = character(), Gene = character(),
     Stage   = character(), N_excluded = integer(),
     Reason  = character(), stringsAsFactors = FALSE
   )
-  
+
   log_exclusion <- function(gene, stage, n_before, n_after, reason) {
     excl_log <<- rbind(excl_log, data.frame(
       Project = project, Gene = gene, Stage = stage,
@@ -149,30 +162,47 @@ analyze_project <- function(project) {
       stringsAsFactors = FALSE
     ))
   }
-  
+
   message(sprintf("\n>>> [%s] Starting REMARK-compliant analysis...", project))
-  
+
   tryCatch({
-    
+
     # --- 4a. Data Download (project-specific dir for HPC thread-safety) -------
     gdc_dir <- file.path("GDCdata", project)
     dir.create(gdc_dir, showWarnings = FALSE, recursive = TRUE)
-    
+
     query <- GDCquery(
       project       = project,
       data.category = "Transcriptome Profiling",
       data.type     = "Gene Expression Quantification",
       workflow.type = "STAR - Counts"
     )
-    suppressMessages({
-      GDCdownload(query, method = "api", directory = gdc_dir)
+    # Fix: method = "client" ist stabiler bei parallelen HPC-Downloads.
+    # method = "api" überlastet die GDC-API bei 48 gleichzeitigen Workern
+    # und erzeugt korrupte .tar.gz-Dateien (gtar: unexpected EOF).
+    # Retry nach 15s für transiente Netzwerkfehler.
+    suppressMessages(
+      tryCatch({
+        GDCdownload(query, method = "client", directory = gdc_dir)
+      }, error = function(e) {
+        message(sprintf("  [%s] Download attempt 1 failed (%s) – retrying in 15s...",
+                        project, e$message))
+        Sys.sleep(15)
+        tryCatch({
+          GDCdownload(query, method = "client", directory = gdc_dir)
+        }, error = function(e2) {
+          stop(sprintf("Download failed after 2 attempts: %s", e2$message))
+        })
+      })
+    )
+    suppressMessages(
       se <- GDCprepare(query, directory = gdc_dir)
-    })
-    
+    )
+
     clin <- GDCquery_clinic(project = project, type = "clinical")
     rd   <- as.data.frame(rowData(se))
     n_raw_clin <- nrow(clin)
-    
+
     # [REMARK Item 13] Quantify missing data in covariates before any merge
     missing_age   <- sum(is.na(as.numeric(clin$age_at_diagnosis)))
     missing_stage <- sum(is.na(parse_stage(clin$ajcc_pathologic_stage)))
@@ -180,121 +210,140 @@ analyze_project <- function(project) {
                     project,
                     missing_age,   100 * missing_age   / nrow(clin),
                     missing_stage, 100 * missing_stage / nrow(clin)))
-    
+
     # Clinical preparation
     clin <- clin %>%
       mutate(
         age_at_diagnosis = as.numeric(age_at_diagnosis),
         stage_num        = parse_stage(ajcc_pathologic_stage)
       )
-    
+
     # --- 4b. Gene Loop --------------------------------------------------------
     for (gene in TARGET_GENES) {
-      
+
       gene_idx <- which(rd$gene_name == gene)
       if (length(gene_idx) == 0) {
         message(sprintf("  [%s] SKIP %s: gene symbol not found in rowData.", project, gene))
         next
       }
-      
+
       # Expression extraction + log2 transformation [REMARK Item 7]
       ens_id   <- rownames(rd)[gene_idx[1]]
       expr_raw <- assay(se, "fpkm_unstrand")[ens_id, ]
-      
+
       df_gene <- data.frame(
         submitter_id = substr(names(expr_raw), 1, 12),
         expression   = log2(as.numeric(expr_raw) + 1)
       ) %>%
         group_by(submitter_id) %>%
         summarise(expression = mean(expression, na.rm = TRUE), .groups = "drop")
-      
+
       n_expr <- nrow(df_gene)
-      
+
       # Marker distribution report [REMARK Item 7]
       project_distributions[[gene]] <- marker_distribution(
         df_gene$expression, gene, project
       )
-      
+
       # --- Merge with clinical ------------------------------------------------
+      # [REMARK Item 13] Fix: defensive Spaltenprüfung vor mutate().
+      # Nicht alle TCGA-Projekte liefern days_to_recurrence (z.B. TCGA-STAD).
+      # Fehlende Spalten führen zu einem Fehler im mutate()-Block, bevor
+      # df_merged zugewiesen werden kann → "object 'df_merged' not found".
       df_merged <- tryCatch({
-        clin %>%
-          inner_join(df_gene, by = "submitter_id") %>%
+        merged <- clin %>% inner_join(df_gene, by = "submitter_id")
+
+        # Obligate Spalte prüfen – ohne OS-Zeit ist die Analyse nicht möglich
+        if (!"days_to_last_follow_up" %in% colnames(merged)) {
+          message(sprintf("  [%s] SKIP %s: days_to_last_follow_up missing.", project, gene))
+          return(NULL)
+        }
+
+        # PFS-Spalte defensiv behandeln: NA wenn nicht vorhanden
+        has_recurrence <- "days_to_recurrence" %in% colnames(merged)
+
+        merged %>%
           mutate(
             # [REMARK Item 5] OS: primary endpoint
-            OS_time   = coalesce(
+            OS_time    = coalesce(
               as.numeric(days_to_death),
               as.numeric(days_to_last_follow_up)
             ),
             OS_status  = as.integer(vital_status == "Dead"),
-            # [REMARK Item 5] PFS: secondary endpoint
+            # [REMARK Item 5] PFS: secondary endpoint (NA wenn keine Rezidiv-Daten)
             PFS_time   = coalesce(
-              as.numeric(days_to_recurrence),
+              if (has_recurrence) as.numeric(days_to_recurrence) else NA_real_,
               as.numeric(days_to_last_follow_up)
             ),
-            PFS_status = as.integer(!is.na(days_to_recurrence))
+            PFS_status = as.integer(
+              has_recurrence & !is.na(days_to_recurrence)
+            )
           )
-      }, error = function(e) NULL)
-      
+      }, error = function(e) {
+        message(sprintf("  [%s] SKIP %s: merge error: %s", project, gene, e$message))
+        NULL
+      })
+
       if (is.null(df_merged)) {
         message(sprintf("  [%s] SKIP %s: merge failed.", project, gene))
         next
       }
-      
+
       n_after_merge <- nrow(df_merged)
       log_exclusion(gene, "merge", n_raw_clin + n_expr, n_after_merge,
                     "no matching submitter_id")
-      
+
       # [REMARK Item 6] Explicit exclusion steps with logging
       n_before <- nrow(df_merged)
       df_merged <- df_merged %>% filter(!is.na(OS_time), OS_time > 0)
       log_exclusion(gene, "OS_time_filter", n_before, nrow(df_merged),
                     "missing or zero OS_time")
-      
+
       n_before <- nrow(df_merged)
       df_merged <- df_merged %>% filter(!is.na(expression))
       log_exclusion(gene, "expression_filter", n_before, nrow(df_merged),
                     "missing expression value")
-      
+
       if (nrow(df_merged) < MIN_SAMPLES) {
         message(sprintf("  [%s] SKIP %s: N=%d < MIN_SAMPLES=%d after exclusions.",
                         project, gene, nrow(df_merged), MIN_SAMPLES))
         next
       }
-      
+
       # [REMARK Item 15] Median follow-up (reverse KM)
       median_fu <- median_followup_reverseKM(df_merged$OS_time, df_merged$OS_status)
-      
+
       # --- Group assignment [REMARK Item 8] -----------------------------------
       grp_res        <- assign_groups(df_merged$expression)
       df_merged$Group <- grp_res$groups
-      
+
       n_before <- nrow(df_merged)
       df_merged <- df_merged %>% filter(!is.na(Group))
       log_exclusion(gene, "middle_tertile_exclusion", n_before, nrow(df_merged),
                     paste0("middle tertile excluded (", CUTOFF_METHOD, ")"))
-      
+
       df_merged$Group <- factor(df_merged$Group, levels = c("Low", "High"))
-      
+
       if (length(unique(df_merged$Group)) < 2) {
         message(sprintf("  [%s] SKIP %s: only one group after split.", project, gene))
         next
       }
-      
+
       # [REMARK Item 9] Event counts
       n_events_os  <- sum(df_merged$OS_status == 1)
       n_high       <- sum(df_merged$Group == "High")
       n_low        <- sum(df_merged$Group == "Low")
-      
+
       if (n_events_os < MIN_EVENTS) {
         message(sprintf("  [%s] SKIP %s: only %d OS events < MIN_EVENTS=%d.",
                         project, gene, n_events_os, MIN_EVENTS))
         next
       }
-      
+
       # ---- OS Analysis -------------------------------------------------------
       fit_os       <- survfit(Surv(OS_time, OS_status) ~ Group, data = df_merged)
       p_logrank_os <- surv_pvalue(fit_os)$pval
-      
+
       # [REMARK Item 12] Univariate Cox with CI
       cox_uv_fit  <- coxph(Surv(OS_time, OS_status) ~ Group, data = df_merged)
       cox_uv_sum  <- summary(cox_uv_fit)
@@ -302,26 +351,26 @@ analyze_project <- function(project) {
       p_uv        <- cox_uv_sum$coefficients["GroupHigh", "Pr(>|z|)"]
       ci_low_uv   <- cox_uv_sum$conf.int["GroupHigh", "lower .95"]
       ci_up_uv    <- cox_uv_sum$conf.int["GroupHigh", "upper .95"]
-      
+
       # [REMARK Item 11] Proportional hazards assumption test (Schoenfeld)
       ph_test_uv    <- tryCatch(cox.zph(cox_uv_fit),    error = function(e) NULL)
       ph_p_uv       <- if (!is.null(ph_test_uv)) ph_test_uv$table["GroupHigh", "p"] else NA_real_
       ph_violated_uv <- !is.na(ph_p_uv) && ph_p_uv < 0.05
-      
+
       if (ph_violated_uv) {
         message(sprintf("  [REMARK Item 11 WARNING] [%s] %s OS: PH assumption violated (p=%.3f). Cox results should be interpreted with caution.",
                         project, gene, ph_p_uv))
       }
-      
+
       # [REMARK Item 10, 16] Multivariate Cox (pre-specified covariates)
       hr_mv <- NA_real_; p_mv <- NA_real_
       ci_low_mv <- NA_real_; ci_up_mv <- NA_real_
       ph_p_mv <- NA_real_; ph_violated_mv <- NA
-      
+
       cov_ok <- sapply(MV_COVARIATES, function(v) {
         sum(!is.na(df_merged[[v]])) >= MV_MIN_OBS
       })
-      
+
       if (all(cov_ok)) {
         tryCatch({
           formula_mv <- as.formula(
@@ -334,12 +383,12 @@ analyze_project <- function(project) {
           p_mv        <- cox_mv_sum$coefficients["GroupHigh", "Pr(>|z|)"]
           ci_low_mv   <- cox_mv_sum$conf.int["GroupHigh", "lower .95"]
           ci_up_mv    <- cox_mv_sum$conf.int["GroupHigh", "upper .95"]
-          
+
           # [REMARK Item 11] PH test for multivariate model
           ph_test_mv    <- tryCatch(cox.zph(cox_mv_fit), error = function(e) NULL)
           ph_p_mv       <- if (!is.null(ph_test_mv)) ph_test_mv$table["GroupHigh", "p"] else NA_real_
           ph_violated_mv <- !is.na(ph_p_mv) && ph_p_mv < 0.05
-          
+
           if (ph_violated_mv) {
             message(sprintf("  [REMARK Item 11 WARNING] [%s] %s OS MV: PH assumption violated (p=%.3f).",
                             project, gene, ph_p_mv))
@@ -352,37 +401,37 @@ analyze_project <- function(project) {
         message(sprintf("  [REMARK Item 13] [%s] %s: MV Cox skipped – insufficient data for: %s",
                         project, gene, paste(missing_covs, collapse = ", ")))
       }
-      
+
       # ---- PFS Analysis [REMARK Item 5] --------------------------------------
       p_logrank_pfs <- NA_real_; hr_pfs <- NA_real_; p_cox_pfs <- NA_real_
       ci_low_pfs <- NA_real_; ci_up_pfs <- NA_real_
       n_events_pfs <- NA_integer_; ph_p_pfs <- NA_real_; ph_violated_pfs <- NA
-      
+
       df_pfs <- df_merged %>% filter(!is.na(PFS_time), PFS_time > 0)
       n_events_pfs_check <- sum(df_pfs$PFS_status == 1, na.rm = TRUE)
-      
+
       if (nrow(df_pfs) >= MIN_SAMPLES &&
           length(unique(df_pfs$Group)) == 2 &&
           n_events_pfs_check >= MIN_EVENTS) {
-        
+
         n_events_pfs <- n_events_pfs_check
-        
+
         tryCatch({
           fit_pfs       <- survfit(Surv(PFS_time, PFS_status) ~ Group, data = df_pfs)
           p_logrank_pfs <- surv_pvalue(fit_pfs)$pval
-          
+
           cox_pfs_fit  <- coxph(Surv(PFS_time, PFS_status) ~ Group, data = df_pfs)
           cox_pfs_sum  <- summary(cox_pfs_fit)
           hr_pfs       <- cox_pfs_sum$coefficients["GroupHigh", "exp(coef)"]
           p_cox_pfs    <- cox_pfs_sum$coefficients["GroupHigh", "Pr(>|z|)"]
           ci_low_pfs   <- cox_pfs_sum$conf.int["GroupHigh", "lower .95"]
           ci_up_pfs    <- cox_pfs_sum$conf.int["GroupHigh", "upper .95"]
-          
+
           # [REMARK Item 11] PH test for PFS
           ph_test_pfs    <- tryCatch(cox.zph(cox_pfs_fit), error = function(e) NULL)
           ph_p_pfs       <- if (!is.null(ph_test_pfs)) ph_test_pfs$table["GroupHigh", "p"] else NA_real_
           ph_violated_pfs <- !is.na(ph_p_pfs) && ph_p_pfs < 0.05
-          
+
           # PFS KM plot
           pdf(file.path(OUT_DIR, "KM_plots",
                         paste0(project, "_", gene, "_PFS_KM.pdf")),
@@ -398,7 +447,7 @@ analyze_project <- function(project) {
           message(sprintf("  [%s] %s: PFS analysis failed: %s", project, gene, e$message))
         })
       }
-      
+
       # ---- OS KM plot [REMARK Items 9, 12] -----------------------------------
       pdf(file.path(OUT_DIR, "KM_plots",
                     paste0(project, "_", gene, "_OS_KM.pdf")),
@@ -410,7 +459,7 @@ analyze_project <- function(project) {
                        palette     = c("#2E9FDF", "#E7B800"),
                        legend.labs = c("Low", "High")))
       dev.off()
-      
+
       # ---- [REMARK Item 20] Limitations flag ---------------------------------
       limitations <- c()
       if (ph_violated_uv)   limitations <- c(limitations, "PH_violated_univariate")
@@ -418,12 +467,12 @@ analyze_project <- function(project) {
       if (isTRUE(ph_violated_pfs)) limitations <- c(limitations, "PH_violated_PFS")
       if (is.na(hr_mv))     limitations <- c(limitations, "multivariate_not_estimable")
       if (missing_age / n_raw_clin > 0.20)
-        limitations <- c(limitations, "age_missing_>20pct")
+                            limitations <- c(limitations, "age_missing_>20pct")
       if (missing_stage / n_raw_clin > 0.20)
-        limitations <- c(limitations, "stage_missing_>20pct")
+                            limitations <- c(limitations, "stage_missing_>20pct")
       limitations_str <- if (length(limitations) > 0) paste(limitations, collapse = "; ") else "none"
-      
-      # ---- Collecting results [REMARK Items 9, 12, 14, 15, 16] -----------------
+
+      # ---- Collect results [REMARK Items 9, 12, 14, 15, 16] -----------------
       project_results[[gene]] <- data.frame(
         # Identity
         Entity                 = project,
@@ -467,24 +516,24 @@ analyze_project <- function(project) {
         Limitations            = limitations_str,
         stringsAsFactors       = FALSE
       )
-      
+
     } # end gene loop
-    
-    # Write exclusion log [REMARK Item 6]
+
+    # Write exclusion log for this project [REMARK Item 6]
     if (nrow(excl_log) > 0) {
       write_csv(excl_log,
                 file.path(OUT_DIR, "exclusion_logs",
                           paste0(project, "_exclusion_log.csv")))
     }
-    
+
     rm(se, clin, rd)
     gc()
-    
+
     return(list(
       results       = bind_rows(project_results),
       distributions = bind_rows(project_distributions)
     ))
-    
+
   }, error = function(e) {
     message(sprintf("[%s] FATAL ERROR: %s", project, e$message))
     return(NULL)
@@ -510,7 +559,31 @@ raw_results <- future_lapply(all_projects, analyze_project, future.seed = TRUE)
 final_df <- bind_rows(lapply(raw_results, function(x) if (!is.null(x)) x$results))
 dist_df  <- bind_rows(lapply(raw_results, function(x) if (!is.null(x)) x$distributions))
 
+# Guard: Abbruch mit informativer Fehlermeldung wenn alle Projekte fehlschlugen.
+# Ursache ist typischerweise ein Download-Fehler (gtar) oder ein fehlender
+# klinischer Spaltenfehler, der in allen Projekten auftrat.
+if (nrow(final_df) == 0 || !"Gene" %in% colnames(final_df)) {
+  n_failed  <- sum(sapply(raw_results, is.null))
+  n_total   <- length(raw_results)
+  stop(sprintf(
+    "FATAL: final_df ist leer (%d/%d Projekte NULL zurückgegeben).\n",
+    "Mögliche Ursachen:\n",
+    "  1. Download-Fehler (gtar corrupt) – prüfe GDCdata/-Verzeichnisse\n",
+    "  2. Klinische Spalten fehlen (days_to_last_follow_up) in allen Projekten\n",
+    "  3. Gene '%s' nicht in TCGA-Daten gefunden\n",
+    "Starte mit einem einzelnen Projekt zum Debuggen:\n",
+    "  analyze_project('TCGA-BRCA')",
+    n_failed, n_total, paste(TARGET_GENES, collapse = "/")
+  ))
+}
+
+message(sprintf("Post-processing: %d Entität-Gen-Paare aus %d/%d Projekten.",
+                nrow(final_df),
+                sum(!sapply(raw_results, is.null)),
+                length(raw_results)))
+
 # [REMARK Item 14] FDR correction per gene across all tested entities
+# Applied to both endpoints and both model types
 final_df <- final_df %>%
   group_by(Gene) %>%
   mutate(
@@ -521,6 +594,7 @@ final_df <- final_df %>%
     Sig_OS_uv           = !is.na(FDR_OS_LogRank)    & FDR_OS_LogRank    < FDR_THRESHOLD,
     Sig_OS_mv           = !is.na(FDR_OS_multivariate) & FDR_OS_multivariate < FDR_THRESHOLD,
     Sig_PFS             = !is.na(FDR_PFS_LogRank)   & FDR_PFS_LogRank   < FDR_THRESHOLD,
+    # Direction coding: only for FDR-significant results
     Direction_OS = dplyr::case_when(
       Sig_OS_uv & HR_OS_uv > 1 ~ "poor_prognosis",
       Sig_OS_uv & HR_OS_uv < 1 ~ "good_prognosis",
@@ -544,7 +618,7 @@ write_csv(dist_df,
 # Convenience subset: significant hits (for downstream analyses only)
 # NOTE [REMARK Item 14]: This file must NOT be the sole reported output.
 sig_df <- final_df %>%
-  filter(Sig_OS_uv | Sig_OS_mv | Sig_PFS)
+          filter(Sig_OS_uv | Sig_OS_mv | Sig_PFS)
 write_csv(sig_df,
           file.path(OUT_DIR, "REMARK_Significant_Hits_FDR05.csv"))
 
