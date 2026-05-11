@@ -42,7 +42,7 @@ suppressPackageStartupMessages({
 
 # --- 2. HPC-Paths -------------------------------------------------------------
 
-HPC_USER       <- Sys.getenv("USER", unset = "rht16170")
+HPC_USER       <- Sys.getenv("USER", unset = "userid")
 HPCWORK_BASE   <- file.path("/hpcwork", HPC_USER)
 WORK_BASE      <- file.path("/work",    HPC_USER)
 
